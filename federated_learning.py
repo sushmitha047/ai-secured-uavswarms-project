@@ -16,6 +16,7 @@ from sklearn.model_selection import train_test_split
 import os
 import glob
 import copy
+from sklearn.preprocessing import StandardScaler
 
 # Two-hidden-layer MLP model
 class MLP(nn.Module):
@@ -50,27 +51,50 @@ class CustomDataset(Dataset):
 # Data quality check and preparation function
 def prepare_data(file_path):
     df = pd.read_csv(file_path)
-    df = df.replace([np.inf, -np.inf], np.nan).dropna()  # Handle Inf and -Inf
+    df = df.replace([np.inf, -np.inf], np.nan).dropna() # Handling Inf and -Inf
     df['marker_encoded'] = df['marker'].map({'Attack': 1, 'Natural': 0})
-    X = df.drop(['marker', 'marker_encoded'], axis=1).values
+    df = df.drop(columns=['marker']).dropna()
+    X = df.drop(columns=['marker_encoded']).values
     y = df['marker_encoded'].values
-    return X, y
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    return X_scaled, y
 
-# Federated training function
-def federated_training(model, datasets, epochs=10):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# Function to average the weights of models
+def average_weights(model_weights):
+    global_weights = copy.deepcopy(model_weights[0])
+    for key in global_weights.keys():
+        for i in range(1, len(model_weights)):
+            global_weights[key] += model_weights[i][key]
+        global_weights[key] = torch.div(global_weights[key], len(model_weights))
+    return global_weights
+
+def federated_training(models, datasets, epochs=10):
+    global_model = models[0]  # Initializing the global model as the first model
+    optimizer = torch.optim.Adam(global_model.parameters(), lr=0.001)
     criterion = nn.NLLLoss()
+
     for epoch in range(epochs):
-        model.train()
-        for dataset in datasets:
+        global_model.train()
+        local_weights = []
+
+        for model, dataset in zip(models, datasets):
+            model.load_state_dict(global_model.state_dict())
             loader = DataLoader(dataset, batch_size=32, shuffle=True)
-            for batch_idx, (data, target) in enumerate(loader):
+            for data, target in loader:
                 optimizer.zero_grad()
                 output = model(data)
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
+            local_weights.append(copy.deepcopy(model.state_dict()))
+
+        # Aggregating the models
+        global_weights = average_weights(local_weights)
+        global_model.load_state_dict(global_weights)
         print(f'Epoch {epoch+1}, Loss: {loss.item()}')
+
+    return global_model
 
 def evaluate(model, test_dataset):
     model.eval()
@@ -90,15 +114,19 @@ folder_path = '/content/drive/MyDrive/GRA/Project/dataset'
 file_paths = glob.glob(os.path.join(folder_path, '*.csv'))
 datasets = [CustomDataset(*prepare_data(file)) for file in file_paths]
 
+# Prepare test dataset from a single dataset
 X_train, X_test, y_train, y_test = train_test_split(*prepare_data(file_paths[0]), test_size=0.2)
 test_dataset = CustomDataset(X_test, y_test)
 
 num_features = X_train.shape[1]
 num_features
 
-# Initialize and train the model
+# Initializing models for each dataset
+num_features = X_train.shape[1]
+models = [MLP(dim_in=num_features, dim_hidden1=100, dim_hidden2=50, dim_out=2) for _ in datasets]
 
-model = MLP(dim_in=num_features, dim_hidden1=100, dim_hidden2=50, dim_out=2)
-federated_training(model, datasets, epochs=10)
+# Training the models in a federated way with aggregation
+global_model = federated_training(models, datasets, epochs=10)
 
-evaluate(model, test_dataset)
+# Evaluate the aggregated model
+evaluate(global_model, test_dataset)
